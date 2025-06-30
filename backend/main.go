@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -204,7 +206,7 @@ func (s *StreamServer) setupAudioConfigs() {
 				"-ar", "44100",
 				"-ac", "2",
 				"-ab", "64k",
-				"-filter:a", "volume=0.3",
+				"-filter:a", "volume=0.15",
 				"pipe:1",
 			},
 		},
@@ -234,7 +236,7 @@ func (s *StreamServer) setupAudioConfigs() {
 				"-ar", "44100",
 				"-ac", "2",
 				"-ab", "64k",
-				"-filter:a", "volume=0.7",
+				"-filter:a", "volume=0.5",
 				"pipe:1",
 			},
 		},
@@ -256,28 +258,34 @@ func (s *StreamServer) setupAudioConfigs() {
 	}
 }
 
+// getAudioFiles finds all audio files in a given directory, sorted alphabetically.
+func (s *StreamServer) getAudioFiles(sourcePath string) ([]string, error) {
+	var files []string
+	// Try common audio formats
+	formats := []string{"*.mp3", "*.wav", "*.ogg", "*.m4a", "*.flac"}
+	for _, format := range formats {
+		matches, err := filepath.Glob(filepath.Join(sourcePath, format))
+		if err != nil {
+			log.Printf("Error globbing for %s: %v", format, err)
+			continue // Try next format
+		}
+		files = append(files, matches...)
+	}
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no audio files found in %s", sourcePath)
+	}
+
+	sort.Strings(files) // Ensure consistent order
+	return files, nil
+}
+
 // getRandomAudioFile finds an audio file in the given directory.
 func (s *StreamServer) getRandomAudioFile(sourcePath string) (string, error) {
-	files, err := filepath.Glob(filepath.Join(sourcePath, "*.mp3"))
+	files, err := s.getAudioFiles(sourcePath)
 	if err != nil {
 		return "", err
 	}
-
-	if len(files) == 0 {
-		// Try other common audio formats
-		formats := []string{"*.wav", "*.ogg", "*.m4a", "*.flac"}
-		for _, format := range formats {
-			files, err = filepath.Glob(filepath.Join(sourcePath, format))
-			if err == nil && len(files) > 0 {
-				break
-			}
-		}
-	}
-
-	if len(files) == 0 {
-		return "", fmt.Errorf("no audio files found in %s", sourcePath)
-	}
-
 	// For simplicity, return the first file. You could randomize this.
 	return files[0], nil
 }
@@ -302,22 +310,78 @@ func (s *StreamServer) manageStreamLifecycle(name string, config AudioConfig) {
 
 // runAndBroadcastStream starts an FFmpeg process and broadcasts its output.
 func (s *StreamServer) runAndBroadcastStream(name string, config AudioConfig) {
-	audioFile, err := s.getRandomAudioFile(config.SourcePath)
-	if err != nil {
-		log.Printf("[%s] ERROR: Failed to get audio file: %v", name, err)
-		return
-	}
+	var cmd *exec.Cmd
+	var audioFileDescription string
 
 	args := make([]string, len(config.FFmpegArgs))
 	copy(args, config.FFmpegArgs)
-	for i, arg := range args {
-		if i > 0 && args[i-1] == "-i" && arg == "" {
-			args[i] = audioFile
-			break
+
+	// For chanting streams, we create a playlist of all files to play in order.
+	// This allows for sequential playback of all files in the directory.
+	if strings.HasPrefix(name, "chanting") {
+		audioFiles, err := s.getAudioFiles(config.SourcePath)
+		if err != nil {
+			log.Printf("[%s] ERROR: Failed to get audio files: %v", name, err)
+			return
 		}
+		if len(audioFiles) == 0 {
+			log.Printf("[%s] ERROR: No audio files found in %s", name, config.SourcePath)
+			return
+		}
+
+		// Create a temporary playlist file for FFmpeg's concat demuxer.
+		playlistFile, err := os.CreateTemp("", "playlist-*.txt")
+		if err != nil {
+			log.Printf("[%s] ERROR: Failed to create playlist file: %v", name, err)
+			return
+		}
+		defer os.Remove(playlistFile.Name()) // Clean up the temp file.
+
+		for _, file := range audioFiles {
+			absPath, err := filepath.Abs(file)
+			if err != nil {
+				log.Printf("[%s] WARNING: Could not get absolute path for '%s': %v", name, file, err)
+				continue
+			}
+			// The 'file' directive is required by the concat demuxer.
+			if _, err := playlistFile.WriteString(fmt.Sprintf("file '%s'\n", absPath)); err != nil {
+				log.Printf("[%s] ERROR: Failed to write to playlist file: %v", name, err)
+				playlistFile.Close()
+				return
+			}
+		}
+		playlistFile.Close() // Close the file so FFmpeg can read it.
+
+		// Modify FFmpeg args to use the playlist instead of a single file.
+		var newArgs []string
+		for i := 0; i < len(args); i++ {
+			if args[i] == "-i" && i+1 < len(args) && args[i+1] == "" {
+				// Replace the single file input with the concat demuxer.
+				newArgs = append(newArgs, "-f", "concat", "-safe", "0", "-i", playlistFile.Name())
+				i++ // Also skip the placeholder "" argument.
+			} else {
+				newArgs = append(newArgs, args[i])
+			}
+		}
+		args = newArgs
+		audioFileDescription = fmt.Sprintf("playlist with %d files", len(audioFiles))
+	} else {
+		// For other streams, use the original logic of picking one file.
+		audioFile, err := s.getRandomAudioFile(config.SourcePath)
+		if err != nil {
+			log.Printf("[%s] ERROR: Failed to get audio file: %v", name, err)
+			return
+		}
+		for i := range args {
+			if i > 0 && args[i-1] == "-i" && args[i] == "" {
+				args[i] = audioFile
+				break
+			}
+		}
+		audioFileDescription = audioFile
 	}
 
-	cmd := exec.Command("ffmpeg", args...)
+	cmd = exec.Command("ffmpeg", args...)
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -330,7 +394,7 @@ func (s *StreamServer) runAndBroadcastStream(name string, config AudioConfig) {
 		log.Printf("[%s] ERROR: Failed to start FFmpeg: %v", name, err)
 		return
 	}
-	log.Printf("[%s] FFmpeg process started with file: %s", name, audioFile)
+	log.Printf("[%s] FFmpeg process started with: %s", name, audioFileDescription)
 
 	broadcaster := NewStreamBroadcaster()
 	s.mu.Lock()
@@ -342,8 +406,12 @@ func (s *StreamServer) runAndBroadcastStream(name string, config AudioConfig) {
 		delete(s.broadcasters, name)
 		s.mu.Unlock()
 		broadcaster.Close()
-		cmd.Process.Kill()
-		cmd.Wait()
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		if cmd != nil {
+			cmd.Wait()
+		}
 		log.Printf("[%s] Cleaned up stream resources.", name)
 	}()
 
