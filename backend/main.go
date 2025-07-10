@@ -192,8 +192,17 @@ func (si *StreamInstance) buildFFmpegCommand(audioDir string) (*exec.Cmd, error)
 		}
 	} else {
 		// Single input or directory of files
-		// Get all MP3 files in the directory for cycling
-		files, err := filepath.Glob(filepath.Join(audioPath, "*.mp3"))
+		// Get all MP3 files in the directory and subdirectories for cycling
+		var files []string
+		err := filepath.WalkDir(audioPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(strings.ToLower(path), ".mp3") {
+				files = append(files, path)
+			}
+			return nil
+		})
 		if err != nil || len(files) == 0 {
 			return nil, fmt.Errorf("no MP3 files found in %s", audioPath)
 		}

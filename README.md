@@ -42,4 +42,23 @@ The backend will determine the ambient audio mix based on Eastern Standard Time.
 
 ## Running in production
 
-First, bundle the frontend into a web ready bundle or whatever and figure out a way to then serve that bundle
+First, bundle the frontend into a web ready bundle or whatever and figure out a way to then serve that bundle.
+
+For the backend, running go run main.go in production is not recommended because:
+
+    It compiles and runs each time (slow and inefficient).
+
+    It doesn’t give you control over binaries and dependencies.
+
+✅ Better Alternative:
+
+Build it once:
+
+cd .../orthodox-cafe-monorepo/backend
+go build -o orthodox-backend main.go
+
+Then update ExecStart:
+
+ExecStart=.../orthodox-cafe-monorepo/backend/orthodox-backend
+
+This is faster, cleaner, and more stable.
