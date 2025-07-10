@@ -1,642 +1,539 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// A client listener is a channel that receives chunks of the stream.
-type client chan []byte
-
-// StreamBroadcaster manages a set of listeners for a single audio stream.
-type StreamBroadcaster struct {
-	mu        sync.Mutex
-	listeners map[client]bool
+// StreamConfig defines the configuration for each stream endpoint
+type StreamConfig struct {
+	AudioPath   string   // Path to audio files (relative to audio directory)
+	FilterGraph string   // FFmpeg filter graph
+	InputFiles  []string // List of input files for multi-input streams
 }
 
-// NewStreamBroadcaster creates a new broadcaster.
-func NewStreamBroadcaster() *StreamBroadcaster {
-	return &StreamBroadcaster{
-		listeners: make(map[client]bool),
+var (
+	streamsActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "webradio_streams_active",
+		Help: "The total number of active streams.",
+	})
+	clientsConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "webradio_clients_connected",
+		Help: "The total number of connected clients per stream.",
+	}, []string{"stream"})
+	httpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "webradio_http_requests_total",
+		Help: "Total number of HTTP requests.",
+	}, []string{"method", "path"})
+)
+
+// ClientConn represents a connected client
+type ClientConn struct {
+	ID       string
+	Response http.ResponseWriter
+	Request  *http.Request
+	Done     chan struct{}
+}
+
+// StreamInstance manages a single stream with its ffmpeg process and connected clients
+type StreamInstance struct {
+	Config    StreamConfig
+	streamKey string
+	ffmpegCmd *exec.Cmd
+	stdout    io.ReadCloser
+	clients   map[*ClientConn]chan []byte
+	stop      chan struct{}
+	mu        sync.RWMutex
+	running   bool
+}
+
+// StreamManager manages all active streams
+type StreamManager struct {
+	mu       sync.RWMutex
+	streams  map[string]*StreamInstance
+	audioDir string
+}
+
+// Global stream configurations
+var streamConfigs = map[string]StreamConfig{
+	"chanting/inside": {
+		AudioPath:   "chanting",
+		FilterGraph: "volume=1.0,highpass=f=300,lowpass=f=3000",
+	},
+	"chanting/outside": {
+		AudioPath:   "chanting",
+		FilterGraph: "volume=1.0,highpass=f=100,lowpass=f=1000",
+	},
+	"rain/inside": {
+		AudioPath:   "rain",
+		FilterGraph: "volume=0.5,highpass=f=300,lowpass=f=2500",
+	},
+	"rain/outside": {
+		AudioPath:   "rain",
+		FilterGraph: "volume=0.6",
+	},
+	"ambient": {
+		AudioPath:   "ambient",
+		FilterGraph: "[0]volume=0.3[d0];[1]volume=0.7[d1];[2]volume=0.3[d2];[3]volume=0.4[d3];[d0][d1][d2][d3]amix=inputs=4",
+		InputFiles:  []string{"crickets.mp3", "doves.mp3", "loons.mp3", "chickadees.mp3"},
+	},
+}
+
+// NewStreamManager creates a new stream manager
+func NewStreamManager(audioDir string) *StreamManager {
+	return &StreamManager{
+		streams:  make(map[string]*StreamInstance),
+		audioDir: audioDir,
 	}
 }
 
-// Broadcast sends a chunk of data to all active listeners.
-func (b *StreamBroadcaster) Broadcast(chunk []byte) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+// GetOrCreateStream gets an existing stream or creates a new one
+func (sm *StreamManager) GetOrCreateStream(streamKey string) (*StreamInstance, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	for listener := range b.listeners {
-		select {
-		case listener <- chunk:
-		default:
-			// If the listener's buffer is full, assume it's a slow client
-			// and disconnect it to avoid blocking the entire broadcast.
-			log.Println("Listener buffer full. Closing and removing listener.")
-			delete(b.listeners, listener)
-			close(listener)
-		}
-	}
-}
-
-// AddListener registers a new client and returns a channel for the stream.
-func (b *StreamBroadcaster) AddListener() client {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// Use a buffered channel to absorb some network latency.
-	listener := make(client, 128)
-	b.listeners[listener] = true
-	log.Printf("New listener added. Total listeners: %d", len(b.listeners))
-	return listener
-}
-
-// RemoveListener unregisters a client.
-func (b *StreamBroadcaster) RemoveListener(listener client) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, ok := b.listeners[listener]; ok {
-		delete(b.listeners, listener)
-		close(listener)
-		log.Printf("Listener removed. Total listeners: %d", len(b.listeners))
-	}
-}
-
-// Close terminates all listener channels.
-func (b *StreamBroadcaster) Close() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for listener := range b.listeners {
-		delete(b.listeners, listener)
-		close(listener)
-	}
-	log.Println("Broadcaster closed, all listeners disconnected.")
-}
-
-// broadcasterWriter is a helper type that implements io.Writer.
-// It allows using a StreamBroadcaster as the destination for io.Copy.
-type broadcasterWriter struct {
-	b *StreamBroadcaster
-}
-
-func (bw *broadcasterWriter) Write(p []byte) (n int, err error) {
-	// Create a copy of the slice, as the buffer `p` will be reused by io.Copy.
-	chunk := make([]byte, len(p))
-	copy(chunk, p)
-	bw.b.Broadcast(chunk)
-	return len(p), nil
-}
-
-// AudioConfig holds the configuration for a single audio stream type.
-type AudioConfig struct {
-	SourcePath  string
-	FFmpegArgs  []string
-	ContentType string
-}
-
-// StreamServer manages the audio configurations and active broadcasters.
-type StreamServer struct {
-	configs      map[string]AudioConfig
-	broadcasters map[string]*StreamBroadcaster
-	mu           sync.RWMutex
-}
-
-// NewStreamServer creates and initializes a new server instance.
-func NewStreamServer() *StreamServer {
-	return &StreamServer{
-		configs:      make(map[string]AudioConfig),
-		broadcasters: make(map[string]*StreamBroadcaster),
-	}
-}
-
-// setupAudioConfigs defines the different audio streams and their FFmpeg settings.
-func (s *StreamServer) setupAudioConfigs() {
-	s.configs = map[string]AudioConfig{
-		"chanting-inside": {
-			SourcePath:  "./audio/chanting/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "", // Placeholder for the input file
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "128k",
-				"-filter:a", "volume=0.8,lowpass=f=3000,highpass=f=300,acompressor=threshold=0.1:ratio=3:attack=20:release=0.1",
-				"pipe:1", // Output to stdout
-			},
-		},
-		"chanting-outside": {
-			SourcePath:  "./audio/chanting/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "128k",
-				"-filter:a", "volume=0.25,lowpass=f=1000,highpass=f=100,acompressor=threshold=0.1:ratio=2:attack=20:release=0.2",
-				"pipe:1",
-			},
-		},
-		"rain-inside": {
-			SourcePath:  "./audio/rain/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "96k",
-				"-filter:a", "volume=0.5,lowpass=f=2500,highpass=f=300,acompressor=threshold=0.2:ratio=1.5",
-				"pipe:1",
-			},
-		},
-		"rain-outside": {
-			SourcePath:  "./audio/rain/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "96k",
-				"-filter:a", "volume=0.6,acompressor=threshold=0.15:ratio=2",
-				"pipe:1",
-			},
-		},
-		"ambient": {
-			SourcePath:  "./audio/ambient/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "64k",
-				"-filter:a", "volume=0.3,lowpass=f=12000,highpass=f=40",
-				"pipe:1",
-			},
-		},
-		"loons": {
-			SourcePath:  "./audio/ambient/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "64k",
-				"-filter:a", "volume=0.15",
-				"pipe:1",
-			},
-		},
-		"crickets": {
-			SourcePath:  "./audio/ambient/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "64k",
-				"-filter:a", "volume=0.3",
-				"pipe:1",
-			},
-		},
-		"doves": {
-			SourcePath:  "./audio/ambient/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "64k",
-				"-filter:a", "volume=0.5",
-				"pipe:1",
-			},
-		},
-		"chickadees": {
-			SourcePath:  "./audio/ambient/",
-			ContentType: "audio/mpeg",
-			FFmpegArgs: []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "",
-				"-f", "mp3",
-				"-ar", "44100",
-				"-ac", "2",
-				"-ab", "64k",
-				"-filter:a", "volume=0.4",
-				"pipe:1",
-			},
-		},
-	}
-}
-
-// getAudioFiles finds all audio files in a given directory, sorted alphabetically.
-func (s *StreamServer) getAudioFiles(sourcePath string) ([]string, error) {
-	var files []string
-	// Try common audio formats
-	formats := []string{"*.mp3", "*.wav", "*.ogg", "*.m4a", "*.flac"}
-	for _, format := range formats {
-		matches, err := filepath.Glob(filepath.Join(sourcePath, format))
-		if err != nil {
-			log.Printf("Error globbing for %s: %v", format, err)
-			continue // Try next format
-		}
-		files = append(files, matches...)
+	// Check if stream already exists
+	if stream, exists := sm.streams[streamKey]; exists {
+		return stream, nil
 	}
 
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no audio files found in %s", sourcePath)
+	// Get stream configuration
+	config, exists := streamConfigs[streamKey]
+	if !exists {
+		return nil, fmt.Errorf("unknown stream: %s", streamKey)
 	}
 
-	sort.Strings(files) // Ensure consistent order
-	return files, nil
+	// Create new stream instance
+	stream := &StreamInstance{
+		Config:    config,
+		streamKey: streamKey,
+		clients:   make(map[*ClientConn]chan []byte),
+		stop:      make(chan struct{}),
+	}
+
+	// Start the stream
+	if err := stream.Start(sm.audioDir, streamKey); err != nil {
+		return nil, fmt.Errorf("failed to start stream: %v", err)
+	}
+
+	sm.streams[streamKey] = stream
+	streamsActive.Inc()
+	return stream, nil
 }
 
-// getRandomAudioFile finds an audio file in the given directory.
-func (s *StreamServer) getRandomAudioFile(sourcePath string) (string, error) {
-	files, err := s.getAudioFiles(sourcePath)
+// Start starts the stream instance with ffmpeg process
+func (si *StreamInstance) Start(audioDir, streamKey string) error {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	if si.running {
+		return nil
+	}
+
+	// Build ffmpeg command
+	cmd, err := si.buildFFmpegCommand(audioDir)
 	if err != nil {
-		return "", err
-	}
-	// For simplicity, return the first file. You could randomize this.
-	return files[0], nil
-}
-
-// startAllStreams launches a manager goroutine for each configured audio stream.
-func (s *StreamServer) startAllStreams() {
-	for name, config := range s.configs {
-		go s.manageStreamLifecycle(name, config)
-	}
-}
-
-// manageStreamLifecycle ensures that a stream's FFmpeg process is always running.
-// If the process exits, it will be restarted after a short delay.
-func (s *StreamServer) manageStreamLifecycle(name string, config AudioConfig) {
-	for {
-		log.Printf("[%s] Starting stream process...", name)
-		s.runAndBroadcastStream(name, config)
-		log.Printf("[%s] Stream process ended. Restarting in 5 seconds...", name)
-		time.Sleep(5 * time.Second)
-	}
-}
-
-// runAndBroadcastStream starts an FFmpeg process and broadcasts its output.
-func (s *StreamServer) runAndBroadcastStream(name string, config AudioConfig) {
-	var cmd *exec.Cmd
-	var audioFileDescription string
-
-	args := make([]string, len(config.FFmpegArgs))
-	copy(args, config.FFmpegArgs)
-
-	// For chanting streams, we create a playlist of all files to play in order.
-	// This allows for sequential playback of all files in the directory.
-	if strings.HasPrefix(name, "chanting") {
-		audioFiles, err := s.getAudioFiles(config.SourcePath)
-		if err != nil {
-			log.Printf("[%s] ERROR: Failed to get audio files: %v", name, err)
-			return
-		}
-		if len(audioFiles) == 0 {
-			log.Printf("[%s] ERROR: No audio files found in %s", name, config.SourcePath)
-			return
-		}
-
-		// Create a temporary playlist file for FFmpeg's concat demuxer.
-		playlistFile, err := os.CreateTemp("", "playlist-*.txt")
-		if err != nil {
-			log.Printf("[%s] ERROR: Failed to create playlist file: %v", name, err)
-			return
-		}
-		defer os.Remove(playlistFile.Name()) // Clean up the temp file.
-
-		for _, file := range audioFiles {
-			absPath, err := filepath.Abs(file)
-			if err != nil {
-				log.Printf("[%s] WARNING: Could not get absolute path for '%s': %v", name, file, err)
-				continue
-			}
-			// The 'file' directive is required by the concat demuxer.
-			if _, err := playlistFile.WriteString(fmt.Sprintf("file '%s'\n", absPath)); err != nil {
-				log.Printf("[%s] ERROR: Failed to write to playlist file: %v", name, err)
-				playlistFile.Close()
-				return
-			}
-		}
-		playlistFile.Close() // Close the file so FFmpeg can read it.
-
-		// Modify FFmpeg args to use the playlist instead of a single file.
-		var newArgs []string
-		for i := 0; i < len(args); i++ {
-			if args[i] == "-i" && i+1 < len(args) && args[i+1] == "" {
-				// Replace the single file input with the concat demuxer.
-				newArgs = append(newArgs, "-f", "concat", "-safe", "0", "-i", playlistFile.Name())
-				i++ // Also skip the placeholder "" argument.
-			} else {
-				newArgs = append(newArgs, args[i])
-			}
-		}
-		args = newArgs
-		audioFileDescription = fmt.Sprintf("playlist with %d files", len(audioFiles))
-	} else {
-		// For other streams, use the original logic of picking one file.
-		audioFile, err := s.getRandomAudioFile(config.SourcePath)
-		if err != nil {
-			log.Printf("[%s] ERROR: Failed to get audio file: %v", name, err)
-			return
-		}
-		for i := range args {
-			if i > 0 && args[i-1] == "-i" && args[i] == "" {
-				args[i] = audioFile
-				break
-			}
-		}
-		audioFileDescription = audioFile
+		return err
 	}
 
-	cmd = exec.Command("ffmpeg", args...)
-	cmd.Stderr = os.Stderr
-
+	si.ffmpegCmd = cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("[%s] ERROR: Failed to create stdout pipe: %v", name, err)
-		return
+		return fmt.Errorf("failed to get stdout pipe: %v", err)
 	}
+	si.stdout = stdout
 
+	// Start ffmpeg process
 	if err := cmd.Start(); err != nil {
-		log.Printf("[%s] ERROR: Failed to start FFmpeg: %v", name, err)
+		return fmt.Errorf("failed to start ffmpeg: %v", err)
+	}
+
+	si.running = true
+
+	// Start goroutine for broadcasting
+	go si.broadcastAudio()
+
+	log.Printf("Started stream with ffmpeg process PID: %d", cmd.Process.Pid)
+	return nil
+}
+
+// buildFFmpegCommand constructs the ffmpeg command based on stream configuration
+func (si *StreamInstance) buildFFmpegCommand(audioDir string) (*exec.Cmd, error) {
+	audioPath := filepath.Join(audioDir, si.Config.AudioPath)
+
+	var args []string
+
+	// Handle multi-input streams (like ambient)
+	if len(si.Config.InputFiles) > 0 {
+		args = append(args, "-re", "-stream_loop", "-1")
+		for _, file := range si.Config.InputFiles {
+			inputPath := filepath.Join(audioPath, file)
+			if _, err := os.Stat(inputPath); os.IsNotExist(err) {
+				return nil, fmt.Errorf("input file not found: %s", inputPath)
+			}
+			args = append(args, "-i", inputPath)
+		}
+	} else {
+		// Single input or directory of files
+		// Get all MP3 files in the directory for cycling
+		files, err := filepath.Glob(filepath.Join(audioPath, "*.mp3"))
+		if err != nil || len(files) == 0 {
+			return nil, fmt.Errorf("no MP3 files found in %s", audioPath)
+		}
+
+		if len(files) == 1 {
+			// Single file - use simple loop
+			args = append(args, "-re", "-stream_loop", "-1", "-i", files[0])
+		} else {
+			// Multiple files - create a playlist approach using concat demuxer
+			// Create temporary playlist content with absolute paths
+			playlistContent := ""
+			for _, file := range files {
+				// Use absolute paths in playlist to avoid path resolution issues
+				absPath, err := filepath.Abs(file)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get absolute path for %s: %v", file, err)
+				}
+				playlistContent += fmt.Sprintf("file '%s'\n", absPath)
+			}
+
+			// Create a temporary playlist file
+			playlistPath := filepath.Join(os.TempDir(), fmt.Sprintf("playlist_%d.txt", time.Now().UnixNano()))
+			if err := os.WriteFile(playlistPath, []byte(playlistContent), 0644); err != nil {
+				return nil, fmt.Errorf("failed to create playlist file: %v", err)
+			}
+
+			// Schedule cleanup of playlist file
+			go func() {
+				time.Sleep(1 * time.Minute) // Give ffmpeg time to start
+				os.Remove(playlistPath)
+			}()
+
+			// Use concat demuxer with infinite loop
+			args = append(args, "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1", "-i", playlistPath)
+		}
+	}
+
+	// Add filter complex if specified
+	if si.Config.FilterGraph != "" {
+		args = append(args, "-filter_complex", si.Config.FilterGraph)
+	}
+
+	// Output format
+	args = append(args, "-f", "mp3", "pipe:1")
+
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stderr = os.Stderr // For debugging
+	return cmd, nil
+}
+
+// broadcastAudio reads from ffmpeg stdout and broadcasts to all clients
+func (si *StreamInstance) broadcastAudio() {
+	defer func() {
+		if si.ffmpegCmd != nil && si.ffmpegCmd.Process != nil {
+			si.ffmpegCmd.Process.Kill()
+		}
+	}()
+
+	reader := bufio.NewReader(si.stdout)
+	buffer := make([]byte, 4096)
+
+	for {
+		select {
+		case <-si.stop:
+			return
+		default:
+			n, err := reader.Read(buffer)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("Error reading from ffmpeg: %v", err)
+				}
+				return
+			}
+
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buffer[:n])
+
+				si.mu.RLock()
+				for client, ch := range si.clients {
+					select {
+					case ch <- data:
+						// Successfully sent
+					default:
+						// Channel is full, client is slow - disconnect them
+						log.Printf("Client %s is slow, disconnecting", client.ID)
+						go func(c *ClientConn) {
+							si.RemoveClient(c, si.streamKey)
+						}(client)
+					}
+				}
+				si.mu.RUnlock()
+			}
+		}
+	}
+}
+
+// AddClient adds a new client to the stream
+func (si *StreamInstance) AddClient(client *ClientConn, streamKey string) {
+	si.mu.Lock()
+	si.clients[client] = make(chan []byte, 100)
+	si.mu.Unlock()
+	clientsConnected.WithLabelValues(streamKey).Inc()
+	log.Printf("Client %s connected to stream", client.ID)
+}
+
+// RemoveClient removes a client from the stream
+func (si *StreamInstance) RemoveClient(client *ClientConn, streamKey string) {
+	si.mu.Lock()
+	if ch, exists := si.clients[client]; exists {
+		close(ch)
+		delete(si.clients, client)
+		clientsConnected.WithLabelValues(streamKey).Dec()
+	}
+	si.mu.Unlock()
+	log.Printf("Client %s disconnected from stream", client.ID)
+}
+
+// Stop stops the stream instance
+func (si *StreamInstance) Stop() {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	if !si.running {
 		return
 	}
-	log.Printf("[%s] FFmpeg process started with: %s", name, audioFileDescription)
 
-	broadcaster := NewStreamBroadcaster()
-	s.mu.Lock()
-	s.broadcasters[name] = broadcaster
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		delete(s.broadcasters, name)
-		s.mu.Unlock()
-		broadcaster.Close()
-		if cmd != nil && cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		if cmd != nil {
-			cmd.Wait()
-		}
-		log.Printf("[%s] Cleaned up stream resources.", name)
-	}()
-
-	// This goroutine reads from FFmpeg and broadcasts the data.
-	go func() {
-		// Use io.Copy for efficient, buffered reading.
-		_, err := io.Copy(&broadcasterWriter{b: broadcaster}, stdout)
-		if err != nil {
-			log.Printf("[%s] Broadcast source finished: %v", name, err)
-		}
-		// When Copy returns, the pipe is broken. Closing it will cause cmd.Wait() to unblock.
-		stdout.Close()
-	}()
-
-	// Wait for the FFmpeg process to exit. This blocks until the stream ends.
-	err = cmd.Wait()
-	log.Printf("[%s] FFmpeg process exited with error: %v", name, err)
+	close(si.stop)
+	if si.ffmpegCmd != nil && si.ffmpegCmd.Process != nil {
+		si.ffmpegCmd.Process.Kill()
+	}
+	si.running = false
+	streamsActive.Dec()
 }
 
-// handleStream connects a client to an existing stream broadcaster.
-func (s *StreamServer) handleStream(streamType string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers for all requests
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Range")
+// streamHandler handles HTTP requests for audio streams
+func (sm *StreamManager) streamHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	category := vars["category"]
+	variation := vars["variation"]
 
-		// Handle preflight CORS requests
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	var streamKey string
+	if variation != "" {
+		streamKey = category + "/" + variation
+	} else {
+		streamKey = category
+	}
 
-		s.mu.RLock()
-		broadcaster, broadcasterExists := s.broadcasters[streamType]
-		config, configExists := s.configs[streamType]
-		s.mu.RUnlock()
+	// Get or create stream
+	stream, err := sm.GetOrCreateStream(streamKey)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Stream not available: %v", err), http.StatusNotFound)
+		return
+	}
 
-		if !broadcasterExists || !configExists {
-			http.Error(w, "Stream not currently available", http.StatusNotFound)
-			return
-		}
+	// Set headers for audio streaming
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		// Set headers for the audio stream
-		w.Header().Set("Content-Type", config.ContentType)
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
+	// Handle preflight requests
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
-		listener := broadcaster.AddListener()
-		defer broadcaster.RemoveListener(listener)
+	// Create client connection
+	clientID := fmt.Sprintf("%s-%d", r.RemoteAddr, time.Now().UnixNano())
+	client := &ClientConn{
+		ID:       clientID,
+		Response: w,
+		Request:  r,
+		Done:     make(chan struct{}),
+	}
 
-		log.Printf("Client connected to stream %s", streamType)
-		ctx := r.Context()
+	// Add client to stream
+	stream.AddClient(client, streamKey)
+	defer stream.RemoveClient(client, streamKey)
 
-		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("Client disconnected from stream %s", streamType)
+	// Get client channel
+	stream.mu.RLock()
+	clientChan, exists := stream.clients[client]
+	stream.mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Failed to register client", http.StatusInternalServerError)
+		return
+	}
+
+	// Stream audio data to client
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Send initial flush to establish connection
+	flusher.Flush()
+
+	for {
+		select {
+		case data, ok := <-clientChan:
+			if !ok {
+				return // Channel closed
+			}
+
+			if _, err := w.Write(data); err != nil {
+				log.Printf("Error writing to client %s: %v", client.ID, err)
 				return
-			case chunk, ok := <-listener:
-				if !ok {
-					log.Printf("Stream %s was closed by the server.", streamType)
-					return
-				}
-				if _, err := w.Write(chunk); err != nil {
-					log.Printf("Error writing to client for stream %s: %v", streamType, err)
-					return
-				}
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
 			}
+			flusher.Flush()
+
+		case <-r.Context().Done():
+			return // Client disconnected
+
+		case <-client.Done:
+			return
 		}
 	}
 }
 
-// handleAmbientNature dynamically mixes and streams ambient sounds based on the time of day.
-func (s *StreamServer) handleAmbientNature() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Range")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		w.Header().Set("Content-Type", "audio/mpeg") // Assuming MP3 output
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-
-		hour := time.Now().Hour()
-		var audioFilesToMix []string
-		basePath := "./audio/ambient/"
-
-		// Determine which audio files to play based on the hour
-		if hour < 6 { // 12am - 6am
-			audioFilesToMix = []string{"loons.mp3", "crickets.mp3"}
-		} else if hour < 12 { // 6am - 12pm
-			audioFilesToMix = []string{"doves.mp3", "chickadees.mp3"}
-		} else if hour < 18 { // 12pm - 6pm
-			audioFilesToMix = []string{"doves.mp3", "chickadees.mp3"}
-		} else { // 6pm - 12am
-			audioFilesToMix = []string{"doves.mp3", "loons.mp3", "crickets.mp3"}
-		}
-
-		// Construct FFmpeg arguments for mixing
-		var ffmpegArgs []string
-		inputCount := len(audioFilesToMix)
-
-		// Add inputs with stream_loop
-		for _, file := range audioFilesToMix {
-			ffmpegArgs = append(ffmpegArgs, "-stream_loop", "-1", "-i", filepath.Join(basePath, file))
-		}
-
-		// Build the filter_complex string
-		if inputCount > 1 {
-			filterComplex := ""
-			for i := 0; i < inputCount; i++ {
-				filterComplex += fmt.Sprintf("[%d:a]", i)
-			}
-			filterComplex += fmt.Sprintf("amerge=inputs=%d[aout]", inputCount)
-			ffmpegArgs = append(ffmpegArgs, "-filter_complex", filterComplex, "-map", "[aout]")
-		} else if inputCount == 1 {
-			ffmpegArgs = append(ffmpegArgs, "-map", "0:a") // Map the single audio stream
-		} else {
-			// No audio files to mix, this case should ideally not happen based on the logic
-			// but if it does, FFmpeg will likely error out.
-		}
-
-		// Common output arguments
-		ffmpegArgs = append(ffmpegArgs,
-			"-f", "mp3",
-			"-ar", "44100",
-			"-ac", "2",
-			"-ab", "64k",
-			"pipe:1", // Output to stdout
-		)
-
-		cmd := exec.Command("ffmpeg", ffmpegArgs...)
-		cmd.Stderr = os.Stderr
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Printf("ERROR: Failed to create stdout pipe for ambient nature stream: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		if err := cmd.Start(); err != nil {
-			log.Printf("ERROR: Failed to start FFmpeg for ambient nature stream: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-		log.Printf("FFmpeg process started for ambient nature stream with args: %v", ffmpegArgs)
-
-		// Ensure FFmpeg process is killed and resources are cleaned up when the client disconnects
-		ctx := r.Context()
-		go func() {
-			<-ctx.Done()
-			log.Println("Client disconnected from ambient nature stream. Killing FFmpeg process.")
-			if cmd.Process != nil {
-				cmd.Process.Kill()
-			}
-		}()
-
-		// Stream FFmpeg output directly to the client
-		_, err = io.Copy(w, stdout)
-		if err != nil {
-			log.Printf("Error streaming ambient nature audio to client: %v", err)
-		}
-
-		// Wait for the FFmpeg process to exit and clean up
-		cmd.Wait()
-		log.Println("FFmpeg process for ambient nature stream exited.")
-	}
-}
-
-// healthCheck provides a simple endpoint to verify the server is running.
-func (s *StreamServer) healthCheck(w http.ResponseWriter, r *http.Request) {
+// healthHandler provides a health check endpoint
+func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "healthy", "timestamp": "` + time.Now().Format(time.RFC3339) + `"}`))
+	w.Write([]byte(`{"status": "healthy"}`))
+}
+
+// listStreamsHandler lists available streams
+func listStreamsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	streams := make([]string, 0, len(streamConfigs))
+	for key := range streamConfigs {
+		streams = append(streams, "/stream/"+key)
+	}
+
+	response := fmt.Sprintf(`{"streams": ["%s"]}`, strings.Join(streams, `", "`))
+	w.Write([]byte(response))
 }
 
 func main() {
-	// Check if FFmpeg is available on the system
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		log.Fatal("FATAL: FFmpeg not found in PATH. Please install FFmpeg.")
-	}
-
-	server := NewStreamServer()
-	server.setupAudioConfigs()
-
-	// Start the persistent FFmpeg processes in the background
-	server.startAllStreams()
-
-	// Setup HTTP routes
-	http.HandleFunc("/stream/chanting/inside", server.handleStream("chanting-inside"))
-	http.HandleFunc("/stream/chanting/outside", server.handleStream("chanting-outside"))
-	http.HandleFunc("/stream/rain/inside", server.handleStream("rain-inside"))
-	http.HandleFunc("/stream/rain/outside", server.handleStream("rain-outside"))
-	http.HandleFunc("/stream/ambient-nature", server.handleAmbientNature())
-	http.HandleFunc("/health", server.healthCheck)
-
-	// Serve static files (if any)
-	http.Handle("/", http.FileServer(http.Dir("./static/")))
-
+	// Get configuration from environment or use defaults
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	log.Printf("Byzantine Chanting Radio Server starting on port %s", port)
-	log.Printf("Streaming endpoints are being initialized...")
-	log.Printf("  - /stream/chanting/inside")
-	log.Printf("  - /stream/chanting/outside")
-	log.Printf("  - /stream/rain/inside")
-	log.Printf("  - /stream/rain/outside")
-	log.Printf("  - /stream/ambient")
-	log.Printf("  - /stream/ambient-nature")
-	log.Printf("  - /health")
-
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal("Server failed to start:", err)
+	audioDir := os.Getenv("AUDIO_DIR")
+	if audioDir == "" {
+		audioDir = "./audio"
 	}
+
+	// Verify audio directory exists
+	if _, err := os.Stat(audioDir); os.IsNotExist(err) {
+		log.Fatalf("Audio directory does not exist: %s", audioDir)
+	}
+
+	// Create stream manager
+	streamManager := NewStreamManager(audioDir)
+
+	// Setup HTTP router
+	r := mux.NewRouter()
+
+	// Stream endpoints
+	r.HandleFunc("/stream/{category}", streamManager.streamHandler).Methods("GET", "OPTIONS")
+	r.HandleFunc("/stream/{category}/{variation}", streamManager.streamHandler).Methods("GET", "OPTIONS")
+
+	// Utility endpoints
+	r.HandleFunc("/health", healthHandler).Methods("GET")
+	r.HandleFunc("/streams", listStreamsHandler).Methods("GET")
+
+	// Metrics endpoint
+	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
+
+	// Middleware for metrics
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			route := mux.CurrentRoute(r)
+			path, _ := route.GetPathTemplate()
+			httpRequestsTotal.WithLabelValues(r.Method, path).Inc()
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	// Create HTTP server
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      r,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 0, // No timeout for streaming
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Setup graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-c
+		log.Println("Shutting down server...")
+
+		// Stop all streams
+		streamManager.mu.Lock()
+		for _, stream := range streamManager.streams {
+			stream.Stop()
+		}
+		streamManager.mu.Unlock()
+
+		// Shutdown HTTP server
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	log.Printf("Starting web radio server on port %s", port)
+	log.Printf("Audio directory: %s", audioDir)
+	log.Printf("Available streams:")
+	for key := range streamConfigs {
+		log.Printf("  - /stream/%s", key)
+	}
+
+	// Pre-start chanting streams
+	log.Println("Pre-starting chanting streams...")
+	chantingStreams := []string{"chanting/inside", "chanting/outside"}
+	for _, streamKey := range chantingStreams {
+		if _, err := streamManager.GetOrCreateStream(streamKey); err != nil {
+			log.Printf("Warning: Failed to pre-start stream %s: %v", streamKey, err)
+		} else {
+			log.Printf("Pre-started stream: %s", streamKey)
+		}
+	}
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+
+	log.Println("Server stopped")
 }

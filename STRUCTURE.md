@@ -1,6 +1,6 @@
 # orthodox.cafe monorepo
 
-This is a monorepo of the new orthodox-cafe web app. It contains a `backend`, written and served with Go, and a `frontend` written in React and Typescript, bundled with Vite, and served with .
+This is a monorepo of the new orthodox-cafe web app. It contains a `backend`, written and served with Go, and a `frontend` written in React and Typescript, bundled with Vite, and served with either Nginx or Bun or Deno.
 
 **The backend is served with the Go runtime AND written in Go.** (`go run main.go`)
 
@@ -13,6 +13,8 @@ This is a monorepo of the new orthodox-cafe web app. It contains a `backend`, wr
 Bun and Vite do a lot of the same things. Vite is our main weapon for development. Such is the state of web development.
 
 (https://bun.sh/guides/ecosystem/vite)
+
+# Overview
 
 This is a rewrite of the original orthodox-lofi project, delivering a Byzantine Chanting web radio with dynamic audio processing and ambient audio.
 
@@ -35,3 +37,9 @@ By default, the user will view the page as standing outside the church of St. Ge
 ## Backend
 
 The backend will determine the ambient audio mix based on Eastern Standard Time. In the future, more endpoints may be added.
+
+## Testing
+
+## Running in production
+
+First, bundle the frontend into a web ready bundle or whatever and figure out a way to then serve that bundle
